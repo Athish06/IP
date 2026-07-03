@@ -423,6 +423,63 @@ jobs:
                   }
               }
               visit(ast.program || ast, null);
+
+              // ── Module-level (global scope) sink detection for JS ──
+              const globalCalls = {};
+              function visitGlobal(node) {
+                  if (!node || typeof node !== 'object') return;
+                  if (isFn(node) || node.type === 'ClassDeclaration' || node.type === 'ClassExpression') return;
+                  
+                  if (node.type === 'CallExpression') {
+                      const calleeName = callName(node.callee);
+                      if (calleeName) {
+                          const root = calleeName.split('.')[0];
+                          const method = calleeName.includes('.') ? calleeName.split('.').pop() : null;
+                          const isDangerous = (
+                              importsList.includes(root) ||
+                              (aliasMap && aliasMap[root]) ||
+                              (method && UNAMBIGUOUS_JS_SINKS.has(method)) ||
+                              UNAMBIGUOUS_JS_SINKS.has(root) ||
+                              DANGEROUS_GLOBALS.has(root)
+                          );
+                          if (isDangerous) {
+                              globalCalls[calleeName] = { module: (aliasMap && aliasMap[root]) ? aliasMap[root] : (importsList.includes(root) ? root : 'builtins'), confidence: 'module_level' };
+                          }
+                      }
+                  }
+                  for (const k of Object.keys(node)) {
+                      if (k==='type'||k==='start'||k==='end'||k==='loc') continue;
+                      const v = node[k];
+                      if (Array.isArray(v)) v.forEach(c => { if (c&&c.type) visitGlobal(c); });
+                      else if (v && typeof v==='object' && v.type) visitGlobal(v);
+                  }
+              }
+
+              if (ast.program && Array.isArray(ast.program.body)) {
+                  ast.program.body.forEach(node => {
+                      if (!isFn(node) && node.type !== 'ClassDeclaration') visitGlobal(node);
+                  });
+              } else {
+                  visitGlobal(ast.program || ast);
+              }
+              
+              if (Object.keys(globalCalls).length > 0) {
+                  let globalSrc = src;
+                  if (globalSrc.length > 3000) globalSrc = globalSrc.substring(0, 3000) + "\n// ... truncated ...";
+                  wrappers.push({
+                      function_name: '<module_global>',
+                      file: relPath,
+                      environment: detectEnvironment(relPath, importsList),
+                      has_auth_check: false,
+                      line_start: 1,
+                      line_end: src.split('\n').length,
+                      calls: Object.keys(globalCalls),
+                      modules_used: [...new Set(Object.values(globalCalls).map(c => c.module))],
+                      source_code: globalSrc,
+                      call_details: globalCalls,
+                  });
+              }
+
               return wrappers;
           }
 
@@ -1285,6 +1342,52 @@ jobs:
                                   "source_code": func_src,
                                   "call_details": {k: v for k, v in calls_found.items()},
                               })
+                  # ── Module-level (global scope) sink detection ──
+                  # Code like: db.execute(request.args.get("q")) at the top level
+                  # has no FunctionDef parent, so it was previously invisible.
+                  module_level_calls = {}
+                  for node in ast.iter_child_nodes(tree):
+                      # Skip FunctionDefs and ClassDefs — we already handled those
+                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                          continue
+                      # Walk this top-level statement for dangerous calls
+                      for child in ast.walk(node):
+                          if isinstance(child, ast.Call):
+                              call_str = _get_call_name(child)
+                              if not call_str:
+                                  continue
+                              root = call_str.split(".")[0]
+                              method = call_str.rsplit(".", 1)[-1] if "." in call_str else None
+                              
+                              is_dangerous = (
+                                  root in imported_names or
+                                  root in dangerous_builtins or
+                                  root in import_derived or
+                                  (method and method in UNAMBIGUOUS_SINK_METHODS)
+                              )
+                              if is_dangerous:
+                                  module_name = imported_names.get(root) or import_derived.get(root) or "builtins"
+                                  module_level_calls[call_str] = {"module": module_name, "confidence": "module_level"}
+
+                  if module_level_calls:
+                      # Bundle all module-level dangerous calls as a single "<module_global>" wrapper
+                      global_src = source  # Send the entire file as context (it's a script)
+                      if len(global_src) > 3000:
+                          global_src = global_src[:3000] + "\n# ... truncated ..."
+                      
+                      wrappers.append({
+                          "function_name": "<module_global>",
+                          "file": rel,
+                          "environment": detect_environment(rel),
+                          "has_auth_check": False,
+                          "line_start": 1,
+                          "line_end": len(source.splitlines()),
+                          "calls": list(module_level_calls.keys()),
+                          "modules_used": list(set(c["module"] for c in module_level_calls.values())),
+                          "source_code": global_src,
+                          "call_details": module_level_calls,
+                      })
+
                   if reached_wrapper_limit:
                       break
               return wrappers
@@ -1394,6 +1497,79 @@ jobs:
 
               return findings
 
+          # ─── PYTHON CALL GRAPH BUILDER ─────────────────────────────────────────
+          def build_python_call_graph(scan_root, display_root, target_files=None, limit_state=None):
+              """
+              Build a global call graph for all Python functions in the repo.
+              
+              Returns:
+                  call_graph: {"func_name|file_path": ["callee_func1", "callee_func2"]}
+                  route_map:  {"func_name|file_path": {"method": "GET", "path": "/users/{id}", "params": ["user_id"]}}
+              """
+              ROUTE_METHODS = {"get", "post", "put", "delete", "patch", "route"}
+              NOISE_BUILTINS = {
+                  "print", "len", "str", "int", "float", "bool",
+                  "list", "dict", "set", "tuple", "type", "isinstance",
+                  "range", "enumerate", "zip", "map", "filter", "sorted",
+                  "super", "hasattr", "getattr", "setattr", "delattr",
+                  "append", "extend", "keys", "values", "items", "format",
+              }
+              call_graph = {}
+              route_map = {}
+              
+              for fp in _iter_target_python_files(scan_root, target_files=target_files, limit_state=limit_state):
+                  try:
+                      with open(fp, "r", errors="ignore") as f:
+                          source = f.read()
+                      tree = ast.parse(source, filename=fp)
+                  except Exception:
+                      continue
+                  
+                  rel = os.path.relpath(fp, display_root).replace("\\\\", "/")
+                  
+                  for node in ast.walk(tree):
+                      if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                          continue
+                      
+                      func_key = f"{node.name}|{rel}"
+                      
+                      # ── Detect route decorators ──
+                      for dec in node.decorator_list:
+                          if isinstance(dec, ast.Call):
+                              dec_name = _get_call_name(dec)
+                              if dec_name:
+                                  parts = dec_name.split(".")
+                                  method_part = parts[-1].lower() if len(parts) > 1 else ""
+                                  if method_part in ROUTE_METHODS:
+                                      path = ""
+                                      if dec.args and isinstance(dec.args[0], ast.Constant):
+                                          path = str(dec.args[0].value)
+                                      params = [
+                                          arg.arg for arg in node.args.args
+                                          if arg.arg not in ("self", "cls", "request", "db")
+                                      ]
+                                      route_map[func_key] = {
+                                          "method": method_part.upper(),
+                                          "path": path,
+                                          "params": params,
+                                      }
+                      
+                      # ── Extract ALL function calls inside this function ──
+                      calls_in_func = set()
+                      for child in ast.walk(node):
+                          if isinstance(child, ast.Call):
+                              call_name = _get_call_name(child)
+                              if call_name:
+                                  # Strip module prefix: "controllers.get_user" → "get_user"
+                                  clean_name = call_name.rsplit(".", 1)[-1]
+                                  if clean_name not in NOISE_BUILTINS:
+                                      calls_in_func.add(clean_name)
+                      
+                      if calls_in_func:
+                          call_graph[func_key] = sorted(calls_in_func)
+              
+              return call_graph, route_map
+
           # ─── ORCHESTRATOR ─────────────────────────────────────────────────────────────
           def _ensure_lang_section(results, lang):
               if lang not in results:
@@ -1463,6 +1639,8 @@ jobs:
               repo_limit_errors = []
               extractor_warnings = []
               total_wrappers = 0
+              py_call_graph = {}
+              py_route_map = {}
 
               for t in targets:
                   lang = t["language"]
@@ -1519,6 +1697,15 @@ jobs:
                               if key not in local_seen:
                                   local_seen.add(key)
                                   wrappers.append(route)
+
+                      # ── Build call graph for cross-file analysis ──
+                      cg, rm = build_python_call_graph(
+                          scan_abs, repo_root,
+                          target_files=(changed_for_target if changed_files_abs else None),
+                          limit_state=wrapper_limit_state,
+                      )
+                      py_call_graph.update(cg)
+                      py_route_map.update(rm)
 
                       if import_limit_state.get("exceeded"):
                           repo_limit_errors.append({
@@ -1645,6 +1832,8 @@ jobs:
                   "language": language,
                   "results": results,
                   "scan_targets": scan_targets,
+                  "call_graph": py_call_graph,
+                  "route_map": py_route_map,
                   "orchestrator": {
                       "anchors_found": len(found_anchors),
                       "targets_selected": len(scan_targets),

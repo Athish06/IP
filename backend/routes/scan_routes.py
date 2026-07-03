@@ -25,6 +25,7 @@ from services.llm_service import (
     build_function_chunk_prompt,
 )
 from services.semgrep_rule_generator import generate_custom_rules, count_generated_rules
+from services.call_graph_resolver import resolve_vulnerable_chains
 
 router = APIRouter(prefix='/scan', tags=['Scans'])
 logger = logging.getLogger(__name__)
@@ -426,6 +427,60 @@ async def _process_wrapper_results_in_background(
             len(section.get("modules", {}).get("sink_modules", []))
             for section in sink_results.values()
         )
+
+        # ── CROSS-FILE CALL GRAPH RESOLUTION (Python only) ────────────────────
+        call_graph = wrapper_data.get("call_graph", {})
+        route_map_data = wrapper_data.get("route_map", {})
+        detected_language = wrapper_data.get("language", "unknown")
+
+        if call_graph and detected_language in ("python", "both"):
+            # Collect all AI-flagged vulnerable wrappers across all language sections
+            all_vuln_wrappers = []
+            for section in sink_results.values():
+                all_vuln_wrappers.extend(section.get("wrapper_functions", []))
+
+            promoted, chains = resolve_vulnerable_chains(
+                call_graph, route_map_data, all_vuln_wrappers
+            )
+
+            if promoted:
+                logger.info(
+                    f"[BG] Call graph promoted {len(promoted)} cross-file wrapper(s) "
+                    f"from {len(chains)} chain(s)"
+                )
+                # Inject promoted wrappers into the Python section of LLM results
+                if "python" in sink_results:
+                    sink_results["python"]["wrapper_functions"].extend(promoted)
+                    vuln_wrapper_count += len(promoted)
+
+                await ws_manager.send_to_scan(scan_id, {
+                    "type": "call_graph_complete",
+                    "scan_id": scan_id,
+                    "chains_found": len(chains),
+                    "promoted_wrappers": len(promoted),
+                    "message": (
+                        f"Cross-file analysis: {len(chains)} attack chain(s) "
+                        f"discovered across {len(promoted)} function(s)"
+                    ),
+                })
+            else:
+                logger.info("[BG] Call graph found no additional cross-file chains")
+        elif detected_language not in ("python", "both") and detected_language != "unknown":
+            # Non-Python language — inform user that cross-file is unavailable
+            lang_display = (
+                "JavaScript/TypeScript"
+                if detected_language in ("react", "javascript", "js")
+                else detected_language
+            )
+            await ws_manager.send_to_scan(scan_id, {
+                "type": "call_graph_skipped",
+                "scan_id": scan_id,
+                "message": (
+                    f"Cross-file analysis is not available for {lang_display}. "
+                    f"Scanning will proceed without cross-file chain detection."
+                ),
+            })
+            logger.info(f"[BG] Cross-file analysis skipped for {detected_language}")
 
         # ── GENERATE CUSTOM SEMGREP RULES ─────────────────────────────────────
         custom_rules_yaml = ""
@@ -1015,6 +1070,8 @@ async def _receive_scan_results_impl(
                                 'sql', 'injection', 'ssrf', 'xxe', 'traversal', 'exec', 'deserialization', 'xss'
                             ])
                             
+                            is_fixora_custom = rule_id.startswith('fixora-taint-') or rule_id.startswith('fixora-wrapper-')
+                            
                             # Was this wrapper marked vulnerable by the AI for this category?
                             was_flagged_for_injection = any(
                                 vw[0] == w_file and vw[1] == w_start and vw[2] == w_end and 
@@ -1023,7 +1080,8 @@ async def _receive_scan_results_impl(
                             )
                             
                             # If Semgrep says it's SQLi, but the AI mathematically cleared this wrapper for SQLi...
-                            if is_injection_rule and not was_flagged_for_injection:
+                            # We NEVER suppress our own dynamically generated BFS rules (fixora_custom).
+                            if is_injection_rule and not was_flagged_for_injection and not is_fixora_custom:
                                 is_safe = True
                                 logger.info(f"SUPPRESSED false positive {rule_id} in {file_path}:{line_start} (AI cleared this wrapper)")
                                 break

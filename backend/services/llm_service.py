@@ -169,14 +169,33 @@ def build_function_chunk_prompt(
             f"    source:\n```{code_fence}\n{w.get('source_code', '')}\n```\n\n"
         )
 
+    if lang_key == "python":
+        task_section = (
+            f"=== TASK ===\n"
+            f"Analyse the {lang_display} wrapper functions below. You have TWO MANDATES:\n"
+            "MANDATE 1 (Smart Auditor): Look for structural and logic flaws (e.g., IDOR, Missing Auth, Mass Assignment, Plaintext Passwords).\n"
+            "MANDATE 2 (Pipeline Integrator): You are Step 1 in a larger scanning architecture. Your output is fed directly into Semgrep for cross-file taint analysis. If you see a generic utility function (e.g., executing SQL, running OS commands, making network requests), you MUST flag it as a HIGH severity injection vulnerability. Flagging it does NOT mean it is a vulnerability; it simply registers the function as a Terminal Sink for Semgrep to hook into. You are strictly forbidden from skipping utility functions to avoid 'false positives'—our Graph Engine handles false positives later in the pipeline.\n"
+            "For each function, determine if it violates either Mandate 1 or Mandate 2.\n"
+            "  - If YES -> include it in the output with vulnerability_type, severity, reason, vulnerable_parameter, malicious_payload, exploit_explanation, and impact_summary.\n"
+            "  - If NO  -> skip it entirely.\n\n"
+        )
+        rule_c = "C. TERMINAL SINK JSON OVERRIDE (CRITICAL FOR MANDATE 2): Because you must flag safe-looking utility wrappers to feed our pipeline, you are permitted to use placeholder explanations. When flagging a generic utility wrapper (like `def raw_execute`), use exactly this JSON output for the explanatory fields to avoid hallucinations: Set `malicious_payload` to `\"<SEMGREP_TAINT_SINK>\"`. Set `exploit_explanation` to `\"Terminal sink identified for Semgrep cross-file taint engine.\"` Set `impact_summary` to `\"Depends on the upstream caller.\"` Do NOT skip the function!\n"
+        json_payload_rule = "IMPORTANT: malicious_payload MUST contain ONLY the raw payload value (string/object/array). No comments, no surrounding function call code. If the vulnerability is an architectural flaw (e.g., IDOR, Missing Auth), set malicious_payload to null. If it is a Mandate 2 Terminal Sink, set it to \"<SEMGREP_TAINT_SINK>\". Do NOT hallucinate payloads.\n"
+    else:
+        task_section = (
+            f"=== TASK ===\n"
+            f"Analyse the {lang_display} wrapper functions below.  "
+            "For each function, determine:\n"
+            "  - Does it pass user-controlled data (or likely user-controlled function parameters) to a dangerous sink WITHOUT sanitisation?\n"
+            "  - If YES -> include it in the output with vulnerability_type, severity, reason, vulnerable_parameter, malicious_payload, exploit_explanation, and impact_summary.\n"
+            "  - If NO  -> skip it entirely.\n\n"
+        )
+        rule_c = "C. CROSS-FILE & UTILITY METHODS (CRITICAL): If a function is a generic database/system wrapper (e.g. `def run_query(self, query): db.execute(query)`), you MUST flag it as vulnerable! Even if there is no HTTP request visible in the snippet, assume `query` is tainted from a higher-level API route. We rely on you to flag these deep sinks so our Call Graph Resolver can trace them backwards. DO NOT SKIP utility functions just because they lack web context!\n"
+        json_payload_rule = "IMPORTANT: malicious_payload MUST contain ONLY the raw payload value (string/object/array). No comments, no surrounding function call code. If the vulnerability is an architectural flaw (e.g., IDOR, Missing Auth, Plaintext Password) and no specific string payload exists, set malicious_payload to null. Do NOT hallucinate payloads.\n"
+
     return (
         "You are an expert application-security engineer performing static analysis.\n\n"
-        f"=== TASK ===\n"
-        f"Analyse the {lang_display} wrapper functions below.  "
-        "For each function, determine:\n"
-        "  - Does it pass user-controlled data (or likely user-controlled function parameters) to a dangerous sink WITHOUT sanitisation?\n"
-        "  - If YES -> include it in the output with vulnerability_type, severity, reason, vulnerable_parameter, malicious_payload, exploit_explanation, and impact_summary.\n"
-        "  - If NO  -> skip it entirely.\n\n"
+        + task_section +
         "=== STRICT TAXONOMY & EXCLUSION RULES ===\n"
         "1. ALLOWED CATEGORIES: You MUST classify vulnerabilities into exactly one of these types: ['SQL Injection', 'Command Injection', 'Path Traversal', 'XSS', 'SSRF', 'Insecure Deserialization', 'IDOR / Broken Access Control', 'Cryptographic Failure', 'Hardcoded Secret', 'Security Misconfiguration', 'Business Logic Flaw', 'Plaintext Password', 'Broken Authentication', 'Missing Authentication', 'Mass Assignment', 'Input Validation Failure', 'Debug Mode Enabled'].\n"
         "2. BUSINESS LOGIC FLAWS: Use this category for logic/workflow bypasses, unhandled promise rejections, state race conditions, and UI de-sync bugs. Do NOT use this for injections.\n"
@@ -192,11 +211,30 @@ def build_function_chunk_prompt(
         "=== TAINT INFERENCE RULES (IMPORTANT) ===\n"
         "A. These functions are pre-filtered wrappers that already call dangerous sinks; assume they are reachable unless code clearly proves internal-only constant input.\n"
         "B. For backend code, treat function parameters as potentially user-controlled by default unless strict sanitisation/allowlisting is present.\n"
-        "C. You do NOT need full caller-graph proof. If unsanitized parameters are concatenated/interpolated/formatted into SQL/command/path/URL sinks, mark vulnerable.\n"
-        "D. If taint source is probable but not explicit in the snippet, still report with severity MEDIUM and explain the assumption clearly.\n"
-        "E. ANTI-PATTERN DETECTION: Some wrappers are marked with anti_pattern field. If anti_pattern == 'plaintext_password_comparison', classify as 'Plaintext Password' with HIGH severity. If anti_pattern == 'missing_authentication', classify as 'Missing Authentication' with HIGH severity without further analysis needed.\n"
-        "F. MASS ASSIGNMENT DETECTION: If a function accepts **kwargs, request.json, request.form, or a dict of user-provided fields and passes it to Model(...) / .update(**data) / .create(**data) without explicit field filtering, classify as 'Mass Assignment'.\n"
-        "G. CONFIGURATION DETECTION: If a function runs the app/server in debug mode (for example app.run(debug=True), app.run(host='0.0.0.0', debug=True), or equivalent JS dev debug exposure in production), classify as 'Debug Mode Enabled'.\n\n"
+        + rule_c +
+        "D. You do NOT need full caller-graph proof. If unsanitized parameters are concatenated/interpolated/formatted into SQL/command/path/URL sinks, mark vulnerable.\n"
+        "E. If taint source is probable but not explicit in the snippet, still report with severity MEDIUM and explain the assumption clearly.\n"
+        "F. ANTI-PATTERN DETECTION: Some wrappers are marked with anti_pattern field. If anti_pattern == 'plaintext_password_comparison', classify as 'Plaintext Password' with HIGH severity. If anti_pattern == 'missing_authentication', classify as 'Missing Authentication' with HIGH severity without further analysis needed.\n"
+        "G. MASS ASSIGNMENT DETECTION: If a function accepts **kwargs, request.json, request.form, or a dict of user-provided fields and passes it to Model(...) / .update(**data) / .create(**data) without explicit field filtering, classify as 'Mass Assignment'.\n"
+        "H. CONFIGURATION DETECTION: If a function runs the app/server in debug mode (for example app.run(debug=True), app.run(host='0.0.0.0', debug=True), or equivalent JS dev debug exposure in production), classify as 'Debug Mode Enabled'.\n\n"
+        "=== DYNAMIC PATTERN EXTRACTION (CRITICAL FOR RULE GENERATION) ===\n"
+        "For EACH vulnerable wrapper, you MUST also provide these 4 fields:\n\n"
+        "1. \"source_patterns\": Array of Semgrep-compatible patterns showing where untrusted data enters this function. "
+        "Use $METAVAR for variable parts. Examples: [\"request.args.get(...)\", \"req.body.$FIELD\", \"event['queryStringParameters']\"].\n"
+        "   If the function parameter itself is the source (no direct web input visible), use the exact parameter name as a pattern, e.g. [\"user_id\", \"query\"].\n"
+        "   IMPORTANT: These must be real patterns from the code you see. Do NOT hallucinate sources that don't exist in the snippet.\n\n"
+        "2. \"sink_patterns\": Array of Semgrep-compatible patterns for the exact dangerous call INSIDE the wrapper. "
+        "Use $OBJ for object metavariables. Examples: [\"cursor.execute(...)\", \"$DB.query(...)\", \"subprocess.run(...)\"]. "
+        "These MUST match the actual sink calls visible in the source code.\n"
+        "   CRITICAL: Do NOT list HTTP parsing, routing, or response functions. "
+        "Only list the specific, core function call that executes the actual exploit (e.g., the database query, the system execution, or the model update).\n\n"
+        "3. \"sanitizer_patterns\": Array of functions/calls that WOULD make this input safe IF they were applied. "
+        "If the code already sanitizes properly, do NOT flag the function as vulnerable at all. "
+        "Only list sanitizers here if the code is MISSING them (i.e., what the developer SHOULD have used). "
+        "Examples: [\"int(...)\", \"bleach.clean(...)\", \"parameterized_query(...)\"]. If no known sanitizer applies, return empty array [].\n\n"
+        "4. \"skip_sanitizer_patterns\": Array of functions that LOOK like sanitizers but are BYPASSABLE "
+        "(e.g., custom URL validators vulnerable to DNS rebinding, incomplete regex filters). "
+        "Examples: [\"is_safe_url(...)\", \"basic_filter(...)\"]. If none, return empty array [].\n\n"
         "SEVERITY GUIDELINES:\n"
         "  HIGH   - Direct path from user input to sink, no sanitisation\n"
         "  MEDIUM - Partial sanitisation, indirect taint path, or probable taint from unsanitized function parameters\n"
@@ -205,7 +243,7 @@ def build_function_chunk_prompt(
         + "RESPOND WITH ONLY VALID JSON. No markdown, no text outside the JSON.\n"
         "IMPORTANT: Do NOT include \"source_code\" in your output - I already have it.\n"
         "IMPORTANT: vulnerable_parameter MUST be the exact tainted argument/path (e.g., 'user_id', 'req.body.username', 'request.query_params[\"id\"]').\n"
-        "IMPORTANT: malicious_payload MUST contain ONLY the raw payload value (string/object/array). No comments, no surrounding function call code. If the vulnerability is an architectural flaw (e.g., IDOR, Missing Auth, Plaintext Password) and no specific string payload exists, set malicious_payload to null. Do NOT hallucinate payloads.\n"
+        + json_payload_rule +
         "IMPORTANT: Do not hallucinate affected parameters. If the vulnerability is structural, explain the architecture flaw in exploit_explanation and leave malicious_payload as null.\n"
         "IMPORTANT: exploit_explanation MUST be 1-2 short sentences that explain exactly how this payload is inserted into the vulnerable flow and reaches the sink.\n"
         "IMPORTANT: impact_summary MUST clearly state what data can be leaked/lost/modified and the likely business impact.\n"
@@ -227,7 +265,11 @@ def build_function_chunk_prompt(
         '          "vulnerable_parameter": "user_id",\n'
         '          "malicious_payload": "1 OR 1=1 --",\n'
         '          "exploit_explanation": "The attacker-controlled user_id is concatenated into the SQL WHERE clause, so the payload converts the predicate into an always-true condition.",\n'
-        '          "impact_summary": "Attackers can exfiltrate all rows from the table and bypass authorization checks tied to user scoping."\n'
+        '          "impact_summary": "Attackers can exfiltrate all rows from the table and bypass authorization checks tied to user scoping.",\n'
+        '          "source_patterns": ["request.args.get(...)"],\n'
+        '          "sink_patterns": ["cursor.execute(...)"],\n'
+        '          "sanitizer_patterns": ["int(...)"],\n'
+        '          "skip_sanitizer_patterns": []\n'
         '        }\n'
         '      ]\n'
         '    }\n'
@@ -348,6 +390,12 @@ def _coalesce_wrapper_fields(row: Dict[str, Any]) -> Dict[str, Any]:
 
     if not item.get("exploit_explanation") and item.get("vulnerability_mechanism"):
         item["exploit_explanation"] = item.get("vulnerability_mechanism")
+
+    # Dynamic pattern fields — safe defaults for backward compatibility
+    item.setdefault("source_patterns", [])
+    item.setdefault("sink_patterns", [])
+    item.setdefault("sanitizer_patterns", [])
+    item.setdefault("skip_sanitizer_patterns", [])
 
     return item
 
@@ -690,8 +738,8 @@ def _build_dynamic_chunks(all_wrappers: list) -> list:
             # alone exceeds the budget (will be marked oversized on flush).
             current_funcs = [func]
             current_tokens = func_tokens
-        elif current_tokens + func_tokens <= FUNCTION_BUDGET_PER_CHUNK:
-            # Fits in the current chunk — append.
+        elif current_tokens + func_tokens <= FUNCTION_BUDGET_PER_CHUNK and len(current_funcs) < 8:
+            # Fits in the current chunk (and under the 8 function limit to prevent LLM truncation)
             current_funcs.append(func)
             current_tokens += func_tokens
         else:
