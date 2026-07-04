@@ -204,5 +204,23 @@ export const api = {
     return response.data;
   },
 
+  // Groq API Key Management
+  saveGroqKey: async (apiKey) => {
+    const response = await axios.put(
+      `${API}/auth/groq-key`,
+      { api_key: apiKey },
+      { headers: getHeaders() }
+    );
+    return response.data;
+  },
+
+  deleteGroqKey: async () => {
+    const response = await axios.delete(
+      `${API}/auth/groq-key`,
+      { headers: getHeaders() }
+    );
+    return response.data;
+  },
+
 };
 export default apiClient;

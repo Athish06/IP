@@ -6,7 +6,8 @@ import {
   ArrowLeft, GitBranch, FileCode, AlertTriangle,
   Folder, ChevronRight, ChevronDown,
   Loader2, CheckCircle, Clock, Shield, GitCommit, Scan, Bug,
-  Terminal, Cpu, Zap, Database, Code2, Bot, RefreshCw, Copy, Check, Eye
+  Terminal, Cpu, Zap, Database, Code2, Bot, RefreshCw, Copy, Check, Eye,
+  File, FileJson, FileText, Image as ImageIcon, Lock, FileCode2
 } from 'lucide-react';
 import DashboardLayout from '../components/DashboardLayout';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
@@ -33,6 +34,7 @@ import {
 import { api } from '../services/api';
 import { toast } from 'sonner';
 import { getCookie } from '../utils/cookies';
+import { useAuthStore } from '../store/authStore';
 
 const UNIFIED_VULN_CATEGORIES = [
   'Injection (SQL/NoSQL/LDAP/Command/Path Traversal)',
@@ -204,17 +206,26 @@ const FileTreeItem = ({ item, level = 0, vulnerabilitiesByFile = {}, onFileClick
 
   const getFileIcon = (path) => {
     const ext = path.split('.').pop().toLowerCase();
-    const iconMap = {
-      js: '📜', jsx: '⚛️', ts: '📘', tsx: '⚛️',
-      py: '🐍', java: '☕', go: '🔷', rs: '🦀',
-      html: '🌐', css: '🎨', scss: '🎨', less: '🎨',
-      json: '📋', yaml: '📋', yml: '📋', toml: '📋',
-      md: '📝', txt: '📄',
-      jpg: '🖼️', png: '🖼️', gif: '🖼️', svg: '🖼️',
-      sh: '💻', bash: '💻', zsh: '💻',
-      lock: '🔒', env: '🔐',
-    };
-    return iconMap[ext] || '📄';
+    
+    switch (ext) {
+      case 'js': case 'jsx': case 'ts': case 'tsx':
+      case 'py': case 'java': case 'go': case 'rs':
+        return <FileCode2 className="w-4 h-4 text-blue-500" />;
+      case 'html': case 'css': case 'scss': case 'less':
+        return <FileCode className="w-4 h-4 text-pink-500" />;
+      case 'json': case 'yaml': case 'yml': case 'toml':
+        return <FileJson className="w-4 h-4 text-green-500" />;
+      case 'md': case 'txt':
+        return <FileText className="w-4 h-4 text-gray-400" />;
+      case 'jpg': case 'png': case 'gif': case 'svg':
+        return <ImageIcon className="w-4 h-4 text-purple-500" />;
+      case 'sh': case 'bash': case 'zsh':
+        return <Terminal className="w-4 h-4 text-gray-300" />;
+      case 'lock': case 'env':
+        return <Lock className="w-4 h-4 text-red-400" />;
+      default:
+        return <File className="w-4 h-4 text-muted-foreground" />;
+    }
   };
 
   const handleClick = () => {
@@ -249,7 +260,7 @@ const FileTreeItem = ({ item, level = 0, vulnerabilitiesByFile = {}, onFileClick
         ) : (
           <>
             <span className="w-4" />
-            <span className="text-sm">{getFileIcon(item.path)}</span>
+            {getFileIcon(item.path)}
           </>
         )}
         <span className={`text-sm truncate ${vulnCount > 0 ? 'font-medium' : ''}`}>{item.name}</span>
@@ -795,6 +806,18 @@ const RepositoryDetail = () => {
   }, [selectedBranch, fetchFileTree, fetchCommits]);
 
   const handleStartScan = async () => {
+    // Block scan if user has no Groq API key
+    const currentUser = useAuthStore.getState().user;
+    if (!currentUser?.has_groq_key) {
+      toast.error('Groq API key required. Go to Settings to add your free API key.', {
+        action: {
+          label: 'Go to Settings',
+          onClick: () => window.location.href = '/settings',
+        },
+      });
+      return;
+    }
+
     // Check if this is first scan or rescan
     const hasScannedBefore = scans.length > 0;
 

@@ -10,7 +10,9 @@ import {
   X,
   PanelLeftClose,
   ChevronRight,
-  BarChart2
+  BarChart2,
+  Settings,
+  AlertTriangle
 } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { Button } from '../components/ui/button';
@@ -72,6 +74,12 @@ const DashboardLayout = ({ children }) => {
       title: '',
       items: [
         { name: 'Benchmark Results', path: '/results', icon: BarChart2 },
+      ]
+    },
+    {
+      title: '',
+      items: [
+        { name: 'Settings', path: '/settings', icon: Settings },
       ]
     }
   ];
@@ -238,6 +246,19 @@ const DashboardLayout = ({ children }) => {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.3, ease: 'easeOut' }}
           >
+            {/* API Key Warning Banner */}
+            {user && !user.has_groq_key && (
+              <div className="mb-4 rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-4 flex items-start gap-3">
+                <AlertTriangle className="w-5 h-5 text-yellow-500 flex-shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <p className="text-sm font-medium text-foreground">Groq API Key Required</p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    You need to configure your Groq API key to run security scans.{' '}
+                    <a href="/settings" className="text-primary hover:underline font-medium">Go to Settings →</a>
+                  </p>
+                </div>
+              </div>
+            )}
             {children}
           </motion.div>
         </div>
